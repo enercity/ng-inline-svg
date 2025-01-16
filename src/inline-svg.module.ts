@@ -6,8 +6,7 @@ import { InlineSVGDirective } from './inline-svg.directive';
 
 @NgModule({
   declarations: [InlineSVGDirective, InlineSVGComponent],
-  exports: [InlineSVGDirective],
-  entryComponents: [InlineSVGComponent]
+  exports: [InlineSVGDirective]
 })
 export class InlineSVGModule {
   static forRoot(config?: InlineSVGConfig): ModuleWithProviders<InlineSVGModule> {
