@@ -1,0 +1,172 @@
+kind: pipeline
+type: docker
+name: deploy to github npm registry
+
+steps:
+  - name: set version
+    image: node:22.8-alpine3.19
+    commands:
+      - apk add jq
+      - export VERSION=${DRONE_TAG:1}
+      - jq '.version = "'"$VERSION"'"' projects/enercity/ng-inline-svg/package.json > package.json.tmp
+      - mv package.json.tmp projects/enercity/ng-inline-svg/package.json
+
+  - name: npm ci
+    image: node:22.8-alpine3.19
+    environment:
+      GITHUB_WRITE_PACKAGES:
+        from_secret: GITHUB_WRITE_PACKAGES
+    commands:
+      - echo "@enercity:registry=https://npm.pkg.github.com" >> .npmrc
+      - echo "//npm.pkg.github.com/:_authToken=$GITHUB_WRITE_PACKAGES" >> .npmrc
+      - npm ci
+
+  - name: npm run build
+    image: node:22.8-alpine3.19
+    commands:
+      - npm run build
+    depends_on:
+      - npm ci
+
+  - name: npm publish
+    image: node:22.8-alpine3.19
+    commands:
+      - cp .npmrc ./dist/enercity/ng-inline-svg/.npmrc
+      - cd dist/enercity/ng-inline-svg && npm publish
+    depends_on:
+      - set version
+      - npm ci
+      - npm run build
+
+trigger:
+  ref:
+    - refs/tags/v*
+  event:
+    - tag
+
+---
+kind: pipeline
+type: docker
+name: deploy to dev
+
+steps:
+  - name: npm audit
+    image: node:22.8-alpine3.19
+    commands:
+      - npm audit --omit=dev --audit-level critical
+
+  - name: create .npmrc
+    image: node:22.8-alpine3.19
+    environment:
+      GITHUB_READ_PACKAGES:
+        from_secret: GITHUB_READ_PACKAGES
+    commands:
+      - echo "@enercity:registry=https://npm.pkg.github.com" >> .npmrc
+      - echo "//npm.pkg.github.com/:_authToken=$GITHUB_READ_PACKAGES" >> .npmrc
+
+  - name: update manifest.json
+    image: node:22.8-alpine3.19
+    commands:
+      - node ./update-manifest.js ${DRONE_COMMIT}
+
+  - name: 'docker build + publish'
+    image: plugins/ecr
+    pull: if-not-exists
+    settings:
+      repo: ng-inline-svg
+      registry: 367771023052.dkr.ecr.eu-central-1.amazonaws.com
+      region: eu-central-1
+      tags:
+        - generic-${DRONE_COMMIT_SHA}
+    depends_on:
+      - create .npmrc
+      - update manifest.json
+
+  - name: 'k8s: kustomize'
+    image: lynqtech/docker-kustomize:1
+    pull: if-not-exists
+    commands:
+      - if [ -z $DRONE_TAG ]; then export APP_ENV=dev; else export APP_ENV=$DRONE_TAG; fi; echo $APP_ENV
+      - kustomize-lqt ng-inline-svg k8s $APP_ENV
+    depends_on:
+      - 'docker build + publish'
+
+  - name: 'k8s: kubeval'
+    image: lynqtech/docker-kubeval:1
+    pull: if-not-exists
+    commands:
+      - kubeval-lqt k8s
+    depends_on:
+      - 'k8s: kustomize'
+
+  - name: 'k8s: upload-manifest-to-s3'
+    image: plugins/s3-sync:latest
+    pull: if-not-exists
+    settings:
+      bucket:
+        from_secret: BUCKET_BUILD_ARTIFACTS
+      region: eu-central-1
+      source: k8s
+      target: /k8s
+      acl: authenticated-read
+    depends_on:
+      - 'k8s: kubeval'
+
+trigger:
+  ref:
+    - refs/heads/main
+    - refs/tags/dev_v*
+  event:
+    - push
+    - tag
+
+---
+kind: pipeline
+name: pullrequest
+type: docker
+
+steps:
+  - name: npm audit
+    image: node:22.8-alpine3.19
+    commands:
+      - npm audit --omit=dev --audit-level critical
+
+  - name: npm ci
+    image: node:22.8-alpine3.19
+    environment:
+      GITHUB_WRITE_PACKAGES:
+        from_secret: GITHUB_WRITE_PACKAGES
+    commands:
+      - echo "@enercity:registry=https://npm.pkg.github.com" >> .npmrc
+      - echo "//npm.pkg.github.com/:_authToken=$GITHUB_WRITE_PACKAGES" >> .npmrc
+      - npm ci
+
+  - name: npm run format:check
+    image: node:22.8-alpine3.19
+    commands:
+      - npm run format:check
+    depends_on:
+      - npm ci
+
+  - name: npm run build
+    image: node:22.8-alpine3.19
+    commands:
+      - npm run build
+    depends_on:
+      - npm ci
+      
+  - name: npm run lint
+    image: node:22.8-alpine3.19
+    commands:
+      - npm run lint
+    depends_on:
+      - npm ci
+
+trigger:
+  event:
+    - pull_request
+
+volumes:
+  - name: dockersock
+    host:
+      path: /var/run/
